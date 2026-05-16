@@ -1,0 +1,110 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h> 
+#include <ESP32Servo.h>
+
+const char* ssid = "your_wifi_name";
+const char* password = "your_wifi_password";
+
+WebServer server(80);
+WebSocketsServer webSocket = WebSocketsServer(81); 
+
+const int ledPin = 2;    
+const int relayPin = 4;  
+const int servoPin = 13; 
+
+Servo myServo; 
+
+// --- VARIABLES FOR SERVO SMOOTHING ---
+int targetAngle = 90;       // The angle requested by the website
+float currentAngle = 90.0;  // The actual physical position of the servo (uses float for ultra-smooth tracking)
+float speedFactor = 0.15;   // ADJUST THIS (0.01 to 1.0): Lower = smoother/slower, Higher = snappier/faster
+unsigned long lastMoveTime = 0;
+const int updateInterval = 15; // How often the servo position updates (in milliseconds)
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  if (type == WStype_TEXT) {
+    String message = String((char*)(payload));
+
+    int colonIndex = message.indexOf(':');
+    if (colonIndex != -1) {
+      String command = message.substring(0, colonIndex);
+      String value = message.substring(colonIndex + 1);
+
+      if (command == "led") {
+        digitalWrite(ledPin, (value == "1") ? HIGH : LOW);
+      } 
+      else if (command == "relay") {
+        digitalWrite(relayPin, (value == "1") ? HIGH : LOW);
+      } 
+      else if (command == "dimmer") {
+        analogWrite(ledPin, value.toInt());
+      } 
+      // NEW SERVO LOGIC: Just update the target. The loop handles the physical movement.
+      else if (command == "servo") {
+        int newTarget = value.toInt();
+        if (newTarget >= 0 && newTarget <= 180) {
+          targetAngle = newTarget; 
+        }
+      }
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(ledPin, OUTPUT);
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(ledPin, LOW);
+  digitalWrite(relayPin, LOW);
+
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  myServo.setPeriodHertz(200);           
+  myServo.attach(servoPin, 500, 2400);  
+  
+  myServo.write(targetAngle); // Start at 90
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  
+  Serial.println("\nWiFi connected.");
+  Serial.print("ESP32 IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  server.on("/", []() { server.send(200, "text/plain", "Active"); });
+  server.begin();
+
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+}
+
+void loop() {
+  server.handleClient();
+  webSocket.loop();
+
+  // --- CONSTANT SPEED SERVO ENGINE (NO LAG) ---
+  if (millis() - lastMoveTime >= updateInterval) {
+    lastMoveTime = millis();
+
+    if (currentAngle != targetAngle) {
+      // Step size dictates speed. 
+      // 4 degrees every 15ms is incredibly fast, but forces sequential stepping.
+      int stepSize = 4; 
+
+      if (targetAngle > currentAngle) {
+        currentAngle += stepSize;
+        if (currentAngle > targetAngle) currentAngle = targetAngle; // Don't overshoot
+      } else {
+        currentAngle -= stepSize;
+        if (currentAngle < targetAngle) currentAngle = targetAngle; // Don't overshoot
+      }
+
+      // Send the crisp step to the digital servo
+      myServo.write(currentAngle);
+    }
+  }
+}
